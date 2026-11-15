@@ -27,7 +27,7 @@ def parse_command(text: str) -> TargetDay | None:
         return resolve_day("tomorrow")
     if arg in {"сегодня", "today"}:
         return resolve_day("today")
-    if arg in {"неделя", "week"}:
+    if arg in {"неделя", "week", "все", "всё"}:
         return resolve_day("week")
 
     # Конкретная дата («!расписание 21.10») — нужный день из любого файла:

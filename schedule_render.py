@@ -30,8 +30,9 @@ from clock import WEEKDAYS_RU
 
 log = logging.getLogger("tg-schedule")
 
-DPI = 200
+DPI = 300
 MAX_IMAGES = 6  # за один день страниц нет; защита на «неделю» и fallback
+MIN_WIDTH_RATIO = 0.6  # ширина картинки ≥ 0.6 высоты: белые поля для Telegram
 DATE_TITLE_RE = re.compile(r"День\s*-\s*([^,\n]+),\s*([0-9]{1,2}\.[0-9]{1,2}\.[0-9]{2,4})")
 GROUP_TOKEN_RE = re.compile(r"^\d{2}-\d{2}[А-Яа-яЁёA-Za-z(\s()]*$", re.I)
 
@@ -177,6 +178,16 @@ def _compose(page, title_clip: fitz.Rect, number_clip: fitz.Rect, block_clip: fi
     result.paste(title, (0, 0))
     result.paste(number, (0, title.height))
     result.paste(block, (number.width, title.height))
+
+    # Telegram в превью чата сильно ужимает вытянутые фото: колонка 1:3.6
+    # становится мелкой и «обрезанной». Добираем белые поля по бокам до
+    # «страничной» пропорции (ширина 0.6 высоты) и центрируем содержимое.
+    target_width = max(width, int(result.height * MIN_WIDTH_RATIO))
+    if target_width > width:
+        canvas = Image.new("RGB", (target_width, result.height), "white")
+        canvas.paste(result, ((target_width - width) // 2, 0))
+        result = canvas
+
     result.save(out)
     for piece in (title_path, number_path, block_path):
         piece.unlink(missing_ok=True)
