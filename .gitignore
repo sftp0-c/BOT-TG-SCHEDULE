@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+*.log
+bot.out
+bot.err
+.cache/
+.ruff_cache/
+tmp/
+data/
+analysis/_render_test/
+analysis/out/
+analysis/out2528/
