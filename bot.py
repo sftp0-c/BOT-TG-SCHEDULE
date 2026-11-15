@@ -28,6 +28,7 @@ from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.exceptions import TelegramNetworkError
 from aiogram.filters import Command
 from aiogram.types import FSInputFile, Message
+from aiogram.utils.media_group import MediaGroupBuilder
 
 import config
 from clock import weekday_name
@@ -177,7 +178,6 @@ async def handle_schedule(message: Message, text: str) -> None:
         if len(photos) == 1:
             await message.answer_photo(photos[0], caption=text_out)
             return
-        from aiogram.media_group import MediaGroupBuilder
         builder = MediaGroupBuilder(caption=text_out)
         for photo in photos:
             builder.add_photo(photo)
