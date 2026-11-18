@@ -18,8 +18,14 @@ WEEKDAYS_RU = (
     "воскресенье",
 )
 
+MAX_BAN_DURATION = timedelta(days=365 * 5)
 _DURATION_PART_RE = re.compile(
-    r"(\d+)\s*(w|н|нед|недел[яьи]?|d|д|дн|дней|дня|день|h|ч|час(?:а|ов)?|m|м|мин(?:ут[аы]?)?|s|с|сек(?:унд[аы]?)?)",
+    r"(?P<amount>\d+)\s*(?P<unit>"
+    r"недел(?:я|и|ь)|нед|weeks?|w|н|"
+    r"дней|дня|день|дн|days?|d|д|"
+    r"часов|часа|час|hours?|h|ч|"
+    r"минут(?:а|ы)?|мин|minutes?|m|м|"
+    r"секунд(?:а|ы)?|сек|seconds?|s|с)\s*",
     re.IGNORECASE,
 )
 
@@ -80,38 +86,42 @@ def week_range(monday: date) -> tuple[date, date]:
 
 
 def parse_duration(raw: str) -> timedelta | None:
-    """Разбирает строку длительности вроде '30m', '2h', '7d', '1w', '1d12h'.
-
-    Если строка не является длительностью (например причина бана), возвращает None.
-    """
-    token = (raw or "").strip()
+    """Разбирает срок бана и безопасно отклоняет неверные/чрезмерные значения."""
+    token = re.sub(r"\s+", "", (raw or "").strip().lower())
     if not token:
         return None
-    matches = list(_DURATION_PART_RE.finditer(token))
-    if not matches:
-        return None
-    # Вся строка должна состоять только из валидных частей длительности (без лишнего текста)
-    joined = "".join(m.group(0) for m in matches)
-    if re.sub(r"\s+", "", joined) != re.sub(r"\s+", "", token):
-        return None
 
-    total = timedelta()
-    for m in matches:
-        amount = int(m.group(1))
+    position = 0
+    total_seconds = 0
+    while position < len(token):
+        match = _DURATION_PART_RE.match(token, position)
+        if match is None:
+            return None
+        amount_text = match.group("amount")
+        if len(amount_text) > 9:
+            return None
+        amount = int(amount_text)
         if amount <= 0:
             return None
-        unit = m.group(2).lower()
-        if unit.startswith(("w", "н")):
-            total += timedelta(weeks=amount)
-        elif unit.startswith(("d", "д")):
-            total += timedelta(days=amount)
-        elif unit.startswith(("h", "ч")):
-            total += timedelta(hours=amount)
-        elif unit.startswith(("m", "м")):
-            total += timedelta(minutes=amount)
-        elif unit.startswith(("s", "с")):
-            total += timedelta(seconds=amount)
-    return total if total.total_seconds() > 0 else None
+
+        unit = match.group("unit").lower()
+        if unit.startswith(("w", "week", "н")):
+            multiplier = 7 * 24 * 60 * 60
+        elif unit.startswith(("d", "day", "д")):
+            multiplier = 24 * 60 * 60
+        elif unit.startswith(("h", "hour", "ч")):
+            multiplier = 60 * 60
+        elif unit.startswith(("m", "minute", "м")):
+            multiplier = 60
+        else:
+            multiplier = 1
+
+        total_seconds += amount * multiplier
+        if total_seconds > int(MAX_BAN_DURATION.total_seconds()):
+            return None
+        position = match.end()
+
+    return timedelta(seconds=total_seconds) if total_seconds else None
 
 
 def format_ban_until(until_ts: float | None, *, now_ts: float | None = None) -> str:

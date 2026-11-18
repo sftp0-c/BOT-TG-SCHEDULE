@@ -34,6 +34,7 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
+from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
@@ -51,6 +52,7 @@ from aiogram.exceptions import (
 from aiogram.filters import Command
 from aiogram.types import (
     BotCommand,
+    BotCommandScopeAllPrivateChats,
     BotCommandScopeChat,
     BotCommandScopeDefault,
     CallbackQuery,
@@ -73,9 +75,9 @@ from clock import (
     week_range,
     weekday_name,
 )
-from commands import parse_command
+from commands import ScheduleArgumentError, parse_command
 from config import validate
-from schedule_render import build_images
+from schedule_render import RenderOut, build_images
 from schedule_render import caption as render_caption
 from schedule_source import download_pdf, fetch_schedule_file, validate_pdf_bytes
 from state import STATE
@@ -95,15 +97,23 @@ COMMAND_RE = r"^\s*[!/](?:расписание|raspisanie|schedule)(?:@[a-zA-Z0-
 BOT_LOCK: io.TextIOWrapper | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class AntiSpamLease:
+    chat_id: int
+    user_id: int
+    target_key: str
+    token: object
+
+
 class AntiSpamGuard:
     """Защита от спама командами и кнопками расписания."""
 
     def __init__(self) -> None:
-        self._in_flight: set[tuple[int, str]] = set()
-        self._user_last_req: dict[int, float] = {}
+        self._in_flight: dict[tuple[int, str], object] = {}
+        self._user_last_req: dict[int, tuple[float, object]] = {}
         self._user_last_warn: dict[int, float] = {}
-        self._chat_last_req: dict[int, float] = {}
-        self._chat_last_target: dict[tuple[int, str], float] = {}
+        self._chat_last_req: dict[int, tuple[float, object]] = {}
+        self._chat_last_target: dict[tuple[int, str], tuple[float, object]] = {}
         self._ban_notice_ts: dict[int, float] = {}
 
     def should_notify_ban(self, user_id: int, now_ts: float | None = None) -> bool:
@@ -114,7 +124,7 @@ class AntiSpamGuard:
             return True
         return False
 
-    def check_and_acquire(
+    def acquire(
         self,
         *,
         chat_id: int,
@@ -122,53 +132,70 @@ class AntiSpamGuard:
         target_key: str,
         is_admin: bool = False,
         now_ts: float | None = None,
-    ) -> tuple[bool, str]:
-        """Проверяет лимиты. Возвращает (разрешено, текст_причины_отказа)."""
+    ) -> tuple[AntiSpamLease | None, str]:
+        """Проверяет лимиты и возвращает lease, который должен быть освобождён."""
         ts = now_ts if now_ts is not None else time.monotonic()
         flight_key = (chat_id, target_key)
 
         if flight_key in self._in_flight:
-            return False, "⏳ Это расписание уже загружается, подождите пару секунд…"
+            return None, "⏳ Это расписание уже загружается, подождите пару секунд…"
 
         if not is_admin:
             user_cd = config.USER_COOLDOWN_SEC
             if user_cd > 0:
                 last_u = self._user_last_req.get(user_id)
-                if last_u is not None and (ts - last_u) < user_cd:
-                    wait = max(1, int(round(user_cd - (ts - last_u))))
-                    return False, f"⏳ Не так быстро! Повторный запрос через {wait} сек."
+                if last_u is not None and (ts - last_u[0]) < user_cd:
+                    wait = max(1, int(round(user_cd - (ts - last_u[0]))))
+                    return None, f"⏳ Не так быстро! Повторный запрос через {wait} сек."
 
             if chat_id < 0:
                 same_cd = config.SAME_TARGET_COOLDOWN_SEC
                 if same_cd > 0:
                     last_same = self._chat_last_target.get((chat_id, target_key))
-                    if last_same is not None and (ts - last_same) < same_cd:
-                        wait = max(1, int(round(same_cd - (ts - last_same))))
+                    if last_same is not None and (ts - last_same[0]) < same_cd:
+                        wait = max(1, int(round(same_cd - (ts - last_same[0]))))
                         return (
-                            False,
+                            None,
                             f"⏳ Это расписание уже отправляли чуть выше 👆 Повтор через {wait} сек.",
                         )
 
                 chat_cd = config.CHAT_COOLDOWN_SEC
                 if chat_cd > 0:
                     last_c = self._chat_last_req.get(chat_id)
-                    if last_c is not None and (ts - last_c) < chat_cd:
-                        wait = max(1, int(round(chat_cd - (ts - last_c))))
-                        return False, f"⏳ В чате действует антиспам-пауза ({wait} сек.)."
+                    if last_c is not None and (ts - last_c[0]) < chat_cd:
+                        wait = max(1, int(round(chat_cd - (ts - last_c[0]))))
+                        return None, f"⏳ В чате действует антиспам-пауза ({wait} сек.)."
 
-        self._in_flight.add(flight_key)
-        self._user_last_req[user_id] = ts
-        self._chat_last_req[chat_id] = ts
-        self._chat_last_target[(chat_id, target_key)] = ts
-        return True, ""
+        token = object()
+        self._in_flight[flight_key] = token
+        self._user_last_req[user_id] = (ts, token)
+        self._chat_last_req[chat_id] = (ts, token)
+        self._chat_last_target[(chat_id, target_key)] = (ts, token)
+        return AntiSpamLease(chat_id, user_id, target_key, token), ""
 
-    def release(self, *, chat_id: int, target_key: str, failed: bool = False, user_id: int | None = None) -> None:
-        self._in_flight.discard((chat_id, target_key))
+    def check_and_acquire(
+        self,
+        **kwargs: Any,
+    ) -> tuple[bool, str]:
+        """Совместимая обёртка для старых вызовов; новые используют ``acquire``."""
+        lease, reason = self.acquire(**kwargs)
+        return lease is not None, reason
+
+    @staticmethod
+    def _drop_if_owned(mapping: dict[Any, tuple[float, object]], key: Any, token: object) -> None:
+        current = mapping.get(key)
+        if current is not None and current[1] is token:
+            mapping.pop(key, None)
+
+    def release(self, lease: AntiSpamLease, *, failed: bool = False) -> None:
+        flight_key = (lease.chat_id, lease.target_key)
+        if self._in_flight.get(flight_key) is not lease.token:
+            return
+        self._in_flight.pop(flight_key, None)
         if failed:
-            # При сетевой ошибке не заставляем ждать полный кулдаун
-            self._chat_last_target.pop((chat_id, target_key), None)
-            if user_id is not None:
-                self._user_last_req.pop(user_id, None)
+            self._drop_if_owned(self._chat_last_target, flight_key, lease.token)
+            self._drop_if_owned(self._user_last_req, lease.user_id, lease.token)
+            self._drop_if_owned(self._chat_last_req, lease.chat_id, lease.token)
 
     def should_send_text_warning(self, user_id: int, now_ts: float | None = None) -> bool:
         """Не позволяет боту самому спамить предупреждениями при флуде командами."""
@@ -181,6 +208,27 @@ class AntiSpamGuard:
 
 
 ANTISPAM = AntiSpamGuard()
+RENDER_SEMAPHORE = asyncio.Semaphore(1)
+WEEKLY_PUBLISH_LOCK = asyncio.Lock()
+
+
+async def _build_images_async(
+    data: bytes,
+    target: date,
+    req_dir: Path,
+    *,
+    week: bool,
+    week_start: date | None = None,
+) -> RenderOut:
+    async with RENDER_SEMAPHORE:
+        return await asyncio.to_thread(
+            build_images,
+            data,
+            target,
+            req_dir,
+            week=week,
+            week_start=week_start,
+        )
 
 
 class AccessAndTrackingMiddleware(BaseMiddleware):
@@ -346,31 +394,56 @@ def _target_key(target: TargetDay) -> str:
     return "week" if target.label == "неделя" else target.day.isoformat()
 
 
+def _admit_schedule_request(
+    message: Message,
+    target: TargetDay,
+    *,
+    requester_id: int | None = None,
+) -> tuple[AntiSpamLease | None, str]:
+    config.reload()
+    uid = requester_id if requester_id is not None else (
+        message.from_user.id if message.from_user else 0
+    )
+    return ANTISPAM.acquire(
+        chat_id=message.chat.id,
+        user_id=uid,
+        target_key=_target_key(target),
+        is_admin=config.is_admin(uid),
+    )
+
+
 async def _send_schedule(
     message: Message,
     target: TargetDay,
     *,
     requester_id: int | None = None,
-    via_callback: bool = False,
 ) -> tuple[bool, str]:
-    """Отправляет расписание по запросу пользователя с проверкой антиспама."""
-    config.reload()
-    uid = requester_id if requester_id is not None else (message.from_user.id if message.from_user else 0)
-    chat_id = message.chat.id
-    t_key = _target_key(target)
-
-    allowed, deny_reason = ANTISPAM.check_and_acquire(
-        chat_id=chat_id,
-        user_id=uid,
-        target_key=t_key,
-        is_admin=config.is_admin(uid),
+    """Получает anti-spam lease и отправляет расписание обычному сообщению."""
+    lease, deny_reason = _admit_schedule_request(
+        message,
+        target,
+        requester_id=requester_id,
     )
-    if not allowed:
-        if not via_callback and uid and ANTISPAM.should_send_text_warning(uid):
+    uid = requester_id if requester_id is not None else (
+        message.from_user.id if message.from_user else 0
+    )
+    if lease is None:
+        if uid and ANTISPAM.should_send_text_warning(uid):
             with suppress(TelegramBadRequest):
                 await message.reply(deny_reason)
         return False, deny_reason
 
+    await _send_schedule_admitted(message, target, lease)
+    return True, ""
+
+
+async def _send_schedule_admitted(
+    message: Message,
+    target: TargetDay,
+    lease: AntiSpamLease,
+) -> None:
+    """Отправляет расписание по уже полученному anti-spam lease."""
+    uid = lease.user_id
     kb = schedule_keyboard(owner_id=uid if uid else None)
     failed = True
 
@@ -429,7 +502,7 @@ async def _send_schedule(
 
         if found.path is not None:
             try:
-                data = validate_pdf_bytes(found.path.read_bytes())
+                data = validate_pdf_bytes(await asyncio.to_thread(found.path.read_bytes))
             except (OSError, ValueError) as exc:
                 log.warning("Локальный файл %s не читается: %s", found.name, exc)
                 await finish_error(
@@ -447,11 +520,16 @@ async def _send_schedule(
                 )
                 return True, ""
 
-        cleanup_stale(TEMP_ROOT)
+        await asyncio.to_thread(cleanup_stale, TEMP_ROOT)
         req_dir = TEMP_ROOT / f"req_{uuid.uuid4().hex[:8]}"
         try:
             is_week = target.label == "неделя"
-            out = build_images(data, target.day, req_dir, week=is_week)
+            out = await _build_images_async(
+                data,
+                target.day,
+                req_dir,
+                week=is_week,
+            )
             if not out.ok or not out.images:
                 reasons = "; ".join(out.notes) or "не удалось подготовить изображение"
                 await finish_error(
@@ -484,20 +562,36 @@ async def _send_schedule(
             )
             return True, ""
         finally:
-            shutil.rmtree(req_dir, ignore_errors=True)
+            await asyncio.to_thread(shutil.rmtree, req_dir, ignore_errors=True)
     finally:
-        ANTISPAM.release(
-            chat_id=chat_id,
-            target_key=t_key,
-            failed=failed,
-            user_id=uid if uid else None,
-        )
+        ANTISPAM.release(lease, failed=failed)
 
 
 # --- Воскресная рассылка на следующую неделю + закреп ---
 
 
 async def publish_weekly_schedule(
+    bot: Bot,
+    *,
+    target_monday: date | None = None,
+    require_target_week: bool = True,
+    notify_chat_id: int | None = None,
+    test_only: bool = False,
+) -> tuple[bool, str]:
+    """Сериализует ручную и автоматическую недельную публикацию."""
+    if WEEKLY_PUBLISH_LOCK.locked():
+        return False, "Недельная рассылка уже выполняется."
+    async with WEEKLY_PUBLISH_LOCK:
+        return await _publish_weekly_schedule(
+            bot,
+            target_monday=target_monday,
+            require_target_week=require_target_week,
+            notify_chat_id=notify_chat_id,
+            test_only=test_only,
+        )
+
+
+async def _publish_weekly_schedule(
     bot: Bot,
     *,
     target_monday: date | None = None,
@@ -531,10 +625,10 @@ async def publish_weekly_schedule(
         log.warning("Недельная рассылка: ошибка скачивания PDF: %s", exc)
         return False, f"Ошибка скачивания PDF ({found.name}): {type(exc).__name__}"
 
-    cleanup_stale(TEMP_ROOT)
+    await asyncio.to_thread(cleanup_stale, TEMP_ROOT)
     req_dir = TEMP_ROOT / f"weekly_{uuid.uuid4().hex[:8]}"
     try:
-        out = build_images(
+        out = await _build_images_async(
             data,
             monday,
             req_dir,
@@ -572,8 +666,17 @@ async def publish_weekly_schedule(
                 await bot.send_media_group(notify_chat_id, builder.build())
             return True, f"Тестовое расписание ({first_day:%d.%m}–{last_day:%d.%m}) отправлено в ЛС."
 
-        chat_ids = STATE.get_weekly_chat_ids()
-        recipients = STATE.get_dispatch_recipients()
+        chat_ids = [
+            cid
+            for cid in STATE.get_weekly_chat_ids()
+            if STATE.chats.get(cid) is None
+            or STATE.chats[cid].last_sent_week_monday != actual_monday.isoformat()
+        ]
+        recipients = [
+            rec
+            for rec in STATE.get_dispatch_recipients()
+            if rec.last_sent_week_monday != actual_monday.isoformat()
+        ]
 
         group_ok = 0
         pin_ok = 0
@@ -593,10 +696,15 @@ async def publish_weekly_schedule(
                     pin_msg_id = msgs[0].message_id if msgs else None
 
                 group_ok += 1
-                old_pin = STATE.record_chat_pin(cid, pin_msg_id, actual_monday.isoformat())
-                if old_pin and old_pin != pin_msg_id:
-                    with suppress(Exception):
-                        await bot.unpin_chat_message(chat_id=cid, message_id=old_pin)
+                STATE.record_chat_pin(
+                    cid,
+                    None,
+                    actual_monday.isoformat(),
+                )
+                old_pin = None
+                known_chat = STATE.chats.get(cid)
+                if known_chat is not None:
+                    old_pin = known_chat.last_pinned_message_id
                 if pin_msg_id is not None:
                     try:
                         await bot.pin_chat_message(
@@ -605,6 +713,17 @@ async def publish_weekly_schedule(
                             disable_notification=True,
                         )
                         pin_ok += 1
+                        STATE.record_chat_pin(
+                            cid,
+                            pin_msg_id,
+                            actual_monday.isoformat(),
+                        )
+                        if old_pin and old_pin != pin_msg_id:
+                            with suppress(Exception):
+                                await bot.unpin_chat_message(
+                                    chat_id=cid,
+                                    message_id=old_pin,
+                                )
                     except Exception as pin_exc:  # noqa: BLE001
                         log.warning("Не удалось закрепить сообщение в чате %s: %s", cid, pin_exc)
                         group_errors.append(f"чат {cid}: отправлено, но нет прав на закреп")
@@ -625,30 +744,37 @@ async def publish_weekly_schedule(
                         builder.add_photo(photo)
                     await bot.send_media_group(rec.user_id, builder.build())
                 dm_ok += 1
+                STATE.mark_dispatch_sent(rec.user_id, actual_monday.isoformat())
                 await asyncio.sleep(0.15)
             except TelegramForbiddenError:
-                dm_fail += 1
+                STATE.disable_unreachable_dispatch(rec.user_id)
             except Exception as dm_exc:  # noqa: BLE001
                 log.debug("Не удалось отправить рассылку пользователю %s: %s", rec.user_id, dm_exc)
                 dm_fail += 1
 
-        if require_target_week:
+        total_destinations = len(chat_ids) + len(recipients)
+        unresolved = len(chat_ids) - group_ok + dm_fail
+        all_delivered = unresolved == 0
+        if require_target_week and all_delivered:
             STATE.set_weekly_sent_monday(monday.isoformat())
 
+        status_icon = "✅" if all_delivered else ("⚠️" if group_ok + dm_ok else "❌")
         summary = (
-            f"✅ Недельная рассылка ({first_day:%d.%m.%Y}–{last_day:%d.%m.%Y}) выполнена.\n"
+            f"{status_icon} Недельная рассылка ({first_day:%d.%m.%Y}–{last_day:%d.%m.%Y}) завершена.\n"
             f"• Групп: {group_ok}/{len(chat_ids)} (закреплено: {pin_ok})\n"
             f"• Пользователей в ЛС: {dm_ok}"
         )
         if dm_fail:
             summary += f" (не доставлено: {dm_fail})"
         if not chat_ids and not recipients:
-            summary += "\nℹ️ Пока нет подключённых групп (/autoschedule on) и подписчиков в ЛС."
+            summary += "\nℹ️ Для этой недели нет новых адресатов: все уже получили расписание или рассылка не подключена."
+        elif not all_delivered:
+            summary += "\n⏳ Не все адресаты получили расписание — автоматическая попытка будет повторена."
         if group_errors:
             summary += "\n⚠️ Замечания: " + "; ".join(group_errors)
-        return True, summary
+        return all_delivered, summary
     finally:
-        shutil.rmtree(req_dir, ignore_errors=True)
+        await asyncio.to_thread(shutil.rmtree, req_dir, ignore_errors=True)
 
 
 async def weekly_scheduler_loop(bot: Bot) -> None:
@@ -717,6 +843,13 @@ def _extract_target_user(message: Message, args_text: str) -> tuple[int | None, 
     """
     tokens = [tok for tok in (args_text or "").strip().split() if tok]
 
+    if tokens:
+        first = tokens[0]
+        looks_like_target = first.lstrip("-").isdigit() or first.startswith("@")
+        if looks_like_target:
+            uid, label = STATE.resolve_user(first)
+            return uid, label, tokens[1:]
+
     if message.reply_to_message and message.reply_to_message.from_user:
         target_u = message.reply_to_message.from_user
         if not target_u.is_bot:
@@ -725,12 +858,6 @@ def _extract_target_user(message: Message, args_text: str) -> tuple[int | None, 
                 username=target_u.username,
                 full_name=target_u.full_name,
             )
-            # Если первый токен совпадает с ID или @username отвечаемого — убираем его из оставшихся
-            if tokens and (
-                tokens[0] == str(target_u.id)
-                or (target_u.username and tokens[0].lstrip("@").lower() == target_u.username.lower())
-            ):
-                tokens = tokens[1:]
             return target_u.id, rec.display_name, tokens
 
     if not tokens:
@@ -763,6 +890,11 @@ async def cmd_help(message: Message) -> None:
 
 @dp.message(Command("stop_mail"))
 async def cmd_stop_mail(message: Message) -> None:
+    if message.chat.type != ChatType.PRIVATE:
+        await message.answer(
+            "Эта команда работает в личном чате с ботом. Откройте бота и отправьте её там."
+        )
+        return
     if not message.from_user:
         return
     _ok, reply = STATE.set_dispatch_self(message.from_user.id, enabled=False)
@@ -771,6 +903,11 @@ async def cmd_stop_mail(message: Message) -> None:
 
 @dp.message(Command("start_mail"))
 async def cmd_start_mail(message: Message) -> None:
+    if message.chat.type != ChatType.PRIVATE:
+        await message.answer(
+            "Эта команда работает в личном чате с ботом. Откройте бота и отправьте её там."
+        )
+        return
     if not message.from_user:
         return
     _ok, reply = STATE.set_dispatch_self(message.from_user.id, enabled=True)
@@ -784,13 +921,14 @@ def _is_admin_user(user_id: int | None) -> bool:
     return bool(user_id) and config.is_admin(user_id)
 
 
+def _is_admin_message(message: Message) -> bool:
+    """Проверяет только Telegram ID администратора, независимо от типа чата."""
+    return bool(message.from_user and config.is_admin(message.from_user.id))
+
+
 def _check_admin_message(message: Message) -> bool:
-    """Админ-команды доступны только в личном чате администратора."""
-    return bool(
-        message.from_user
-        and message.chat.type == ChatType.PRIVATE
-        and config.is_admin(message.from_user.id)
-    )
+    """Чувствительные админ-команды доступны только в личном чате."""
+    return bool(_is_admin_message(message) and message.chat.type == ChatType.PRIVATE)
 
 
 def _admin_panel_text() -> str:
@@ -892,10 +1030,19 @@ async def cmd_ban(message: Message) -> None:
     duration = None
     reason_tokens = rest
     if rest:
-        parsed_dur = parse_duration(rest[0])
-        if parsed_dur is not None:
-            duration = parsed_dur
+        first = rest[0].lower()
+        if first in {"навсегда", "forever", "permanent"}:
             reason_tokens = rest[1:]
+        else:
+            parsed_dur = parse_duration(first)
+            if parsed_dur is not None:
+                duration = parsed_dur
+                reason_tokens = rest[1:]
+            elif first[:1].isdigit():
+                await message.answer(
+                    "⚠️ Некорректный срок. Примеры: 30m, 2h, 7d, 1w или «навсегда»."
+                )
+                return
     reason = " ".join(reason_tokens).strip()
 
     rec = STATE.ban_user(
@@ -978,8 +1125,8 @@ async def cmd_unmute_dispatch(message: Message) -> None:
 
 
 @dp.message(Command("autoschedule"))
-async def cmd_autoschedule(message: Message) -> None:
-    if not _check_admin_message(message):
+async def cmd_autoschedule(message: Message, bot: Bot) -> None:
+    if not _is_admin_message(message):
         return
     tokens = [t for t in _command_args(message).split() if t]
     if not tokens or tokens[0].lower() not in {"on", "off", "вкл", "выкл"}:
@@ -991,20 +1138,46 @@ async def cmd_autoschedule(message: Message) -> None:
         return
 
     enable = tokens[0].lower() in {"on", "вкл"}
-    target_chat_id: int | None = None
+    target_chat_id: int
     target_title = ""
 
-    if len(tokens) >= 2 and tokens[1].lstrip("-").isdigit():
-        target_chat_id = int(tokens[1])
-    elif message.chat.type in {ChatType.GROUP, ChatType.SUPERGROUP}:
+    if message.chat.type in {ChatType.GROUP, ChatType.SUPERGROUP}:
+        if len(tokens) != 1:
+            await message.answer(
+                "⚠️ В группе команда настраивает только текущий чат: "
+                "/autoschedule on или /autoschedule off"
+            )
+            return
         target_chat_id = message.chat.id
         target_title = message.chat.title or ""
+    else:
+        if len(tokens) != 2:
+            await message.answer(
+                "⚠️ В ЛС укажите отрицательный ID группы: "
+                "/autoschedule on -1001234567890"
+            )
+            return
+        try:
+            target_chat_id = int(tokens[1])
+        except ValueError:
+            await message.answer("⚠️ ID группы должен быть целым отрицательным числом.")
+            return
+        if target_chat_id >= 0:
+            await message.answer("⚠️ Telegram ID группы должен быть отрицательным.")
+            return
 
-    if target_chat_id is None:
-        await message.answer(
-            "⚠️ Вы пишете в ЛС — укажите ID группы (посмотреть список чатов: /weekly_chats)."
-        )
-        return
+        if enable:
+            try:
+                target_chat = await bot.get_chat(target_chat_id)
+            except (TelegramBadRequest, TelegramForbiddenError):
+                await message.answer(
+                    "⚠️ Бот не видит этот чат. Сначала добавьте бота в группу."
+                )
+                return
+            if target_chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP}:
+                await message.answer("⚠️ Указанный ID не является группой.")
+                return
+            target_title = target_chat.title or ""
 
     rec = STATE.set_chat_weekly(target_chat_id, enabled=enable, title=target_title)
     title_str = f"«{rec.title}» " if rec.title else ""
@@ -1102,18 +1275,37 @@ async def cmd_weekly_now(message: Message, bot: Bot) -> None:
 # --- Основные команды расписания ---
 
 
+async def _parse_and_send_schedule(
+    message: Message,
+    *,
+    allow_bare: bool,
+) -> bool:
+    try:
+        target = parse_command(message.text or "", allow_bare=allow_bare)
+    except ScheduleArgumentError as exc:
+        await message.reply(
+            f"⚠️ {exc}\n\nПример: /расписание завтра или /расписание 21.10"
+        )
+        return True
+    if target is None:
+        return False
+    await _send_schedule(message, target)
+    return True
+
+
 @dp.message(Command("расписание", "raspisanie", "schedule"))
 async def cmd_schedule(message: Message) -> None:
-    target = parse_command(message.text or "", allow_bare=False)
-    if target is not None:
-        await _send_schedule(message, target)
+    await _parse_and_send_schedule(message, allow_bare=False)
 
 
 @dp.message(F.text.regexp(COMMAND_RE, flags=2))
 async def bang_command(message: Message) -> None:
-    target = parse_command(message.text or "", allow_bare=False)
-    if target is not None:
-        await _send_schedule(message, target)
+    await _parse_and_send_schedule(message, allow_bare=False)
+
+
+@dp.message(F.chat.type == ChatType.PRIVATE, F.text)
+async def private_bare_schedule(message: Message) -> None:
+    await _parse_and_send_schedule(message, allow_bare=True)
 
 
 @dp.callback_query(F.data.startswith("sched:"))
@@ -1133,6 +1325,10 @@ async def cb_schedule(callback: CallbackQuery) -> None:
     chat_id = callback.message.chat.id if callback.message is not None else 0
 
     if owner_id is not None and clicker_id != owner_id:
+        await callback.answer(
+            "⛔ Это меню вызвал другой пользователь.\nНапишите /расписание, чтобы открыть своё.",
+            show_alert=True,
+        )
         STATE.record_button_press(
             user_id=clicker_id,
             username=clicker.username if clicker else None,
@@ -1143,49 +1339,58 @@ async def cb_schedule(callback: CallbackQuery) -> None:
             allowed=False,
             deny_reason="menu_owner_mismatch",
         )
-        await callback.answer(
-            "⛔ Это меню вызвал другой пользователь.\nНапишите /расписание, чтобы открыть своё.",
-            show_alert=True,
-        )
         return
 
     if callback.message is None:
         await callback.answer()
         return
 
-    config.reload()
     target = resolve_day(kind)
-    ok, deny_reason = await _send_schedule(
+    lease, deny_reason = _admit_schedule_request(
         callback.message,
         target,
         requester_id=clicker_id,
-        via_callback=True,
     )
-
-    STATE.record_button_press(
-        user_id=clicker_id,
-        username=clicker.username if clicker else None,
-        full_name=clicker.full_name if clicker else None,
-        chat_id=chat_id,
-        kind=kind,
-        owner_id=owner_id,
-        allowed=ok,
-        deny_reason=deny_reason,
-    )
-    log.info(
-        "INLINE_BUTTON kind=%s clicker=%s (%s) owner=%s chat=%s allowed=%s",
-        kind,
-        clicker_id,
-        (clicker.username or clicker.full_name or "") if clicker else "",
-        owner_id,
-        chat_id,
-        ok,
-    )
-
-    if not ok and deny_reason:
+    allowed = lease is not None
+    if lease is None:
         await callback.answer(deny_reason, show_alert=False)
-    else:
+        STATE.record_button_press(
+            user_id=clicker_id,
+            username=clicker.username if clicker else None,
+            full_name=clicker.full_name if clicker else None,
+            chat_id=chat_id,
+            kind=kind,
+            owner_id=owner_id,
+            allowed=False,
+            deny_reason=deny_reason,
+        )
+        return
+
+    try:
         await callback.answer()
+        STATE.record_button_press(
+            user_id=clicker_id,
+            username=clicker.username if clicker else None,
+            full_name=clicker.full_name if clicker else None,
+            chat_id=chat_id,
+            kind=kind,
+            owner_id=owner_id,
+            allowed=True,
+            deny_reason="",
+        )
+        log.info(
+            "INLINE_BUTTON kind=%s clicker=%s (%s) owner=%s chat=%s allowed=%s",
+            kind,
+            clicker_id,
+            (clicker.username or clicker.full_name or "") if clicker else "",
+            owner_id,
+            chat_id,
+            allowed,
+        )
+        await _send_schedule_admitted(callback.message, target, lease)
+    finally:
+        # Идемпотентная страховка на случай ошибки до входа в admitted-обработчик.
+        ANTISPAM.release(lease, failed=True)
 
 
 @dp.callback_query(F.data.startswith("admin:"))
@@ -1196,9 +1401,14 @@ async def cb_admin_menu(callback: CallbackQuery, bot: Bot) -> None:
     if not _is_admin_user(uid):
         await callback.answer("⛔ Только администратор бота может вызывать это меню.", show_alert=True)
         return
-    action = (callback.data or "").split(":", 1)[1] if callback.data else ""
     chat = callback.message
-    chat_id = chat.chat.id if chat is not None else (uid or 0)
+    if chat is None or chat.chat.type != ChatType.PRIVATE:
+        await callback.answer(
+            "⛔ Админское меню доступно только в личном чате с ботом.",
+            show_alert=True,
+        )
+        return
+    action = (callback.data or "").split(":", 1)[1] if callback.data else ""
     text: str | None = None
     if action == "panel":
         text = _admin_panel_text()
@@ -1209,21 +1419,28 @@ async def cb_admin_menu(callback: CallbackQuery, bot: Bot) -> None:
     if text is None:
         await callback.answer("Неизвестное действие меню.", show_alert=True)
         return
-    await bot.send_message(chat_id=chat_id, text=text)
+    await callback.answer()
+    await bot.send_message(chat_id=chat.chat.id, text=text)
 
 
 async def setup_bot_commands(bot: Bot) -> None:
-    user_commands = [
+    public_commands = [
         BotCommand(command="raspisanie", description="Расписание (авто: сегодня/завтра)"),
         BotCommand(command="schedule", description="Расписание на день или неделю"),
-        BotCommand(command="stop_mail", description="Остановить рассылку расписания в ЛС"),
-        BotCommand(command="start_mail", description="Включить рассылку расписания в ЛС"),
         BotCommand(command="help", description="Справка и кнопки выбора"),
     ]
+    private_commands = public_commands + [
+        BotCommand(command="stop_mail", description="Остановить рассылку расписания в ЛС"),
+        BotCommand(command="start_mail", description="Включить рассылку расписания в ЛС"),
+    ]
     with suppress(Exception):
-        await bot.set_my_commands(user_commands, scope=BotCommandScopeDefault())
+        await bot.set_my_commands(public_commands, scope=BotCommandScopeDefault())
+        await bot.set_my_commands(
+            private_commands,
+            scope=BotCommandScopeAllPrivateChats(),
+        )
 
-    admin_commands = user_commands + [
+    admin_commands = private_commands + [
         BotCommand(command="admin", description="👑 Панель администратора"),
         BotCommand(command="users", description="👑 Список пользователей (ID/@username)"),
         BotCommand(command="ban", description="👑 Ограничить доступ пользователю"),

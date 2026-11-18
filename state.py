@@ -6,6 +6,7 @@ import logging
 import os
 import threading
 import time
+from contextlib import suppress
 from dataclasses import asdict, dataclass
 from datetime import timedelta
 from pathlib import Path
@@ -27,6 +28,7 @@ class UserRecord:
     dispatch_enabled: bool = True
     dispatch_muted_by_admin: bool = False
     last_seen: float = 0.0
+    last_sent_week_monday: str | None = None
 
     @property
     def display_name(self) -> str:
@@ -98,9 +100,9 @@ class BotState:
         self.chats.clear()
         self.weekly_sent_monday = None
         self.button_presses = []
-        self._loaded_path = target
 
         if not target.is_file():
+            self._loaded_path = target
             return
         try:
             raw = json.loads(target.read_text(encoding="utf-8"))
@@ -109,11 +111,16 @@ class BotState:
             return
 
         if not isinstance(raw, dict):
+            log.warning("Некорректный формат состояния %s: корень должен быть объектом", target)
             return
+        self._loaded_path = target
 
         self.weekly_sent_monday = raw.get("weekly_sent_monday") or None
 
-        for uid_str, item in (raw.get("users") or {}).items():
+        users_raw = raw.get("users") or {}
+        for uid_str, item in (users_raw.items() if isinstance(users_raw, dict) else []):
+            if not isinstance(item, dict):
+                continue
             try:
                 uid = int(uid_str)
                 self.users[uid] = UserRecord(
@@ -124,11 +131,15 @@ class BotState:
                     dispatch_enabled=bool(item.get("dispatch_enabled", True)),
                     dispatch_muted_by_admin=bool(item.get("dispatch_muted_by_admin", False)),
                     last_seen=float(item.get("last_seen") or 0.0),
+                    last_sent_week_monday=item.get("last_sent_week_monday") or None,
                 )
             except (TypeError, ValueError):
                 continue
 
-        for uid_str, item in (raw.get("bans") or {}).items():
+        bans_raw = raw.get("bans") or {}
+        for uid_str, item in (bans_raw.items() if isinstance(bans_raw, dict) else []):
+            if not isinstance(item, dict):
+                continue
             try:
                 uid = int(uid_str)
                 until_raw = item.get("until")
@@ -143,7 +154,10 @@ class BotState:
             except (TypeError, ValueError):
                 continue
 
-        for cid_str, item in (raw.get("chats") or {}).items():
+        chats_raw = raw.get("chats") or {}
+        for cid_str, item in (chats_raw.items() if isinstance(chats_raw, dict) else []):
+            if not isinstance(item, dict):
+                continue
             try:
                 cid = int(cid_str)
                 pin_raw = item.get("last_pinned_message_id")
@@ -158,7 +172,8 @@ class BotState:
             except (TypeError, ValueError):
                 continue
 
-        for item in raw.get("button_presses") or []:
+        presses_raw = raw.get("button_presses") or []
+        for item in presses_raw if isinstance(presses_raw, list) else []:
             try:
                 if not isinstance(item, dict):
                     continue
@@ -192,9 +207,21 @@ class BotState:
             "chats": {str(cid): asdict(rec) for cid, rec in sorted(self.chats.items())},
             "button_presses": [asdict(rec) for rec in self.button_presses],
         }
-        tmp = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+        tmp = target.with_name(f".{target.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+        backup = target.with_suffix(target.suffix + ".bak")
         tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        with suppress(OSError):
+            os.chmod(tmp, 0o600)
+        if target.is_file():
+            try:
+                backup.write_bytes(target.read_bytes())
+                with suppress(OSError):
+                    os.chmod(backup, 0o600)
+            except OSError as exc:
+                log.warning("Не удалось обновить резервную копию %s: %s", backup, exc)
         os.replace(tmp, target)
+        with suppress(OSError):
+            os.chmod(target, 0o600)
 
     # --- Пользователи ---
 
@@ -431,6 +458,24 @@ class BotState:
                 recipients.append(rec)
             return recipients
 
+    def mark_dispatch_sent(self, user_id: int, week_monday_iso: str) -> None:
+        with self._lock:
+            self._ensure_loaded()
+            rec = self.users.get(user_id)
+            if rec is None:
+                return
+            rec.last_sent_week_monday = week_monday_iso
+            self._save()
+
+    def disable_unreachable_dispatch(self, user_id: int) -> None:
+        with self._lock:
+            self._ensure_loaded()
+            rec = self.users.get(user_id)
+            if rec is None:
+                return
+            rec.dispatch_enabled = False
+            self._save()
+
     # --- Чаты для воскресного автопостинга с закрепом ---
 
     def touch_chat(self, chat_id: int, title: str = "") -> ChatRecord | None:
@@ -471,7 +516,11 @@ class BotState:
     def get_weekly_chat_ids(self) -> list[int]:
         with self._lock:
             self._ensure_loaded()
-            result: list[int] = list(config.WEEKLY_CHAT_IDS)
+            result: list[int] = []
+            for cid in config.WEEKLY_CHAT_IDS:
+                stored = self.chats.get(cid)
+                if stored is None or stored.weekly_enabled:
+                    result.append(cid)
             for cid, rec in sorted(self.chats.items()):
                 if rec.weekly_enabled and cid not in result:
                     result.append(cid)

@@ -22,6 +22,7 @@ import config
 log = logging.getLogger("tg-schedule")
 
 USER_AGENT = "tg-schedule-bot/1.0"
+HTML_MAX_BYTES = 4 * 1024 * 1024
 MAX_PDF_BYTES = 40 * 1024 * 1024
 PDF_MAGIC = b"%PDF"
 HREF_RE = re.compile(r'href=["\']([^"\']+\.pdf[^"\']*)["\']', re.IGNORECASE)
@@ -204,6 +205,48 @@ async def _get_with_retry(
     raise last_exc
 
 
+async def _get_limited(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    max_bytes: int,
+    attempts: int = 2,
+) -> tuple[httpx.Response, bytes]:
+    """Загружает ответ потоково и прекращает чтение сразу после лимита."""
+    last_exc: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            async with client.stream("GET", url) as response:
+                response.raise_for_status()
+                length = response.headers.get("content-length")
+                if length and length.isdigit() and int(length) > max_bytes:
+                    raise ValueError(f"ответ превышает лимит {max_bytes // (1024 * 1024)} МБ")
+                chunks: list[bytes] = []
+                total = 0
+                async for chunk in response.aiter_bytes():
+                    total += len(chunk)
+                    if total > max_bytes:
+                        raise ValueError(
+                            f"ответ превышает лимит {max_bytes // (1024 * 1024)} МБ"
+                        )
+                    chunks.append(chunk)
+                return response, b"".join(chunks)
+        except httpx.HTTPStatusError as exc:
+            last_exc = exc
+            if exc.response.status_code >= 500 and attempt + 1 < attempts:
+                await asyncio.sleep(0.6 * (attempt + 1))
+                continue
+            raise
+        except httpx.TransportError as exc:
+            last_exc = exc
+            if attempt + 1 < attempts:
+                await asyncio.sleep(0.6 * (attempt + 1))
+                continue
+            raise
+    assert last_exc is not None
+    raise last_exc
+
+
 async def fetch_schedule_file() -> ScheduleFile | None:
     """Найти актуальный PDF: локальный (если задан) → страницы → меню → прямая ссылка."""
     local = take_local_pdf()
@@ -224,14 +267,18 @@ async def fetch_schedule_file() -> ScheduleFile | None:
                 return None
             tried.add(url)
             try:
-                response = await _get_with_retry(client, url)
-                response.raise_for_status()
-                if len(response.content) > 4 * 1024 * 1024:
-                    raise ValueError("страница расписаний слишком большая")
-                return pick_schedule_url_from_html(
-                    response.text, str(response.url), patterns, config.TARGET_GROUP
+                response, content = await _get_limited(
+                    client,
+                    url,
+                    max_bytes=HTML_MAX_BYTES,
                 )
-            except httpx.HTTPError as exc:
+                return pick_schedule_url_from_html(
+                    content.decode(response.encoding or "utf-8", errors="replace"),
+                    str(response.url),
+                    patterns,
+                    config.TARGET_GROUP,
+                )
+            except (httpx.HTTPError, ValueError) as exc:
                 log.debug("Не удалось загрузить страницу %s: %s", url, exc)
                 return None
 
@@ -243,10 +290,17 @@ async def fetch_schedule_file() -> ScheduleFile | None:
         # Автопоиск по меню раздела, если адрес php-страницы поменяли
         if config.SCHEDULE_MENU_URL:
             try:
-                menu_response = await _get_with_retry(client, config.SCHEDULE_MENU_URL)
-                menu_response.raise_for_status()
+                menu_response, menu_content = await _get_limited(
+                    client,
+                    config.SCHEDULE_MENU_URL,
+                    max_bytes=HTML_MAX_BYTES,
+                )
+                menu_html = menu_content.decode(
+                    menu_response.encoding or "utf-8",
+                    errors="replace",
+                )
                 guesses: list[str] = []
-                for href in HREF_ANY_RE.findall(menu_response.text):
+                for href in HREF_ANY_RE.findall(menu_html):
                     full = urljoin(str(menu_response.url), unescape(href.strip()))
                     path = unquote(urlsplit(full).path)
                     if not DISCOVER_RE.search(path):
@@ -260,7 +314,7 @@ async def fetch_schedule_file() -> ScheduleFile | None:
                     found = await page_pdf(guess)
                     if found is not None:
                         return found
-            except httpx.HTTPError as exc:
+            except (httpx.HTTPError, ValueError) as exc:
                 log.debug("Не удалось загрузить меню %s: %s", config.SCHEDULE_MENU_URL, exc)
 
         # Запасной вариант: прямая ссылка и её варианты («изм», «(изм)», « 1»)
@@ -278,12 +332,16 @@ async def fetch_schedule_file() -> ScheduleFile | None:
 
 
 async def download_pdf(url: str) -> bytes:
-    """Скачивает PDF с проверкой сигнатуры %PDF и размера."""
+    """Скачивает PDF потоково с проверкой сигнатуры и жёстким лимитом."""
     async with httpx.AsyncClient(
         follow_redirects=True,
         timeout=60.0,
         headers={"User-Agent": USER_AGENT},
     ) as client:
-        response = await _get_with_retry(client, url, attempts=2)
-        response.raise_for_status()
-    return validate_pdf_bytes(response.content)
+        _response, content = await _get_limited(
+            client,
+            url,
+            max_bytes=MAX_PDF_BYTES,
+            attempts=2,
+        )
+    return validate_pdf_bytes(content)

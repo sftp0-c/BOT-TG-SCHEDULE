@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+exec "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/tg-schedule-ctl" "$@"

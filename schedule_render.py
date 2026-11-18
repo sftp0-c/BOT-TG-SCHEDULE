@@ -13,10 +13,10 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
-import fitz  # PyMuPDF
+import pymupdf as fitz
 
 import config
 from clock import WEEKDAYS_RU
@@ -25,6 +25,9 @@ log = logging.getLogger("tg-schedule")
 
 DPI = 300
 MAX_IMAGES = 7  # до 7 дней (Пн–Вс) на «неделю»
+MAX_PDF_PAGES = 32
+MAX_PAGE_POINTS = 5000
+MAX_PAGE_PIXELS = 60_000_000
 MIN_WIDTH_RATIO = 0.6  # ширина картинки >= 0.6 высоты: белые поля для Telegram
 DATE_TITLE_RE = re.compile(
     r"День\s*[-–—]\s*([^,\n]+),\s*([0-9]{1,2}\.[0-9]{1,2}\.[0-9]{2,4})"
@@ -292,8 +295,25 @@ def build_images(
     result = RenderOut(ok=False, requested_group=group)
     doc = fitz.open(stream=data, filetype="pdf")
     try:
+        if doc.needs_pass:
+            result.notes.append("PDF защищён паролем и не может быть обработан.")
+            return result
+        if len(doc) > MAX_PDF_PAGES:
+            result.notes.append(
+                f"В PDF слишком много страниц ({len(doc)}; максимум {MAX_PDF_PAGES})."
+            )
+            return result
+
         titled: list[tuple[date, str, int, fitz.Page]] = []
         for index, page in enumerate(doc):
+            if page.rect.width > MAX_PAGE_POINTS or page.rect.height > MAX_PAGE_POINTS:
+                result.notes.append("Размер страницы PDF превышает безопасный предел.")
+                return result
+            scale = DPI / 72.0
+            pixels = int(page.rect.width * scale) * int(page.rect.height * scale)
+            if pixels > MAX_PAGE_PIXELS:
+                result.notes.append("Страница PDF потребует слишком много памяти для рендера.")
+                return result
             parsed, day_name = _title_of(page)
             if parsed is not None:
                 titled.append((parsed, day_name, index, page))
@@ -304,8 +324,6 @@ def build_images(
         if week:
             ordered = sorted(titled, key=lambda item: item[0])
             if week_start is not None:
-                from datetime import timedelta
-
                 week_end = week_start + timedelta(days=6)
                 chosen = [item for item in ordered if week_start <= item[0] <= week_end]
                 if not chosen:
@@ -317,7 +335,22 @@ def build_images(
                     )
                     return result
             else:
-                chosen = ordered
+                target_monday = target - timedelta(days=target.weekday())
+                target_sunday = target_monday + timedelta(days=6)
+                chosen = [
+                    item
+                    for item in ordered
+                    if target_monday <= item[0] <= target_sunday
+                ]
+                if not chosen:
+                    latest = ordered[-1][0]
+                    latest_monday = latest - timedelta(days=latest.weekday())
+                    latest_sunday = latest_monday + timedelta(days=6)
+                    chosen = [
+                        item
+                        for item in ordered
+                        if latest_monday <= item[0] <= latest_sunday
+                    ]
         else:
             chosen = [
                 item for item in sorted(titled, key=lambda item: item[0]) if item[0] == target
@@ -333,8 +366,10 @@ def build_images(
 
         for parsed, day_name, index, page in chosen[:MAX_IMAGES]:
             out = out_dir / f"day_{parsed:%d%m}_p{index + 1}.png"
+            out.unlink(missing_ok=True)
             ok_crop = _crop_day(page, group, out)
-            if not ok_crop and not out.exists():
+            if not ok_crop or not out.is_file():
+                out.unlink(missing_ok=True)
                 continue
             result.images.append(
                 ImageSlice(

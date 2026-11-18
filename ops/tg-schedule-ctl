@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+
+ROOT="${BOT_SCHEDULE_ROOT:-/opt/bot-tg-schedule}"
+SERVICE="bot-tg-schedule"
+CONTAINER="bot-tg-schedule"
+IMAGE="${BOT_IMAGE:-bot-tg-schedule:latest}"
+BACKUP_DIR="${BACKUP_DIR:-${ROOT}/.backups}"
+
+compose() {
+    BOT_IMAGE="$IMAGE" docker compose --project-directory "$ROOT" -f "$ROOT/docker-compose.yml" "$@"
+}
+
+usage() {
+    cat <<'HELP'
+Управление TG-ботом расписания (tg-schedule-ctl / bot-schedule-ctl):
+  status             статус контейнера и образ
+  logs [N]           последние N строк логов (по умолчанию 100)
+  logs -f [N]        смотреть логи
+  test               изолированные тесты без production .env/data
+  backup             архивировать .env и data
+  rebuild            backup, test, пересобрать и запустить
+  restart|start|stop управление контейнером
+  exec [команда]     выполнить команду в контейнере
+HELP
+}
+
+run_test() {
+    DOCKER_BUILDKIT=1 docker build \
+        --network host \
+        --target test \
+        --tag bot-tg-schedule:test-local \
+        "$ROOT"
+}
+
+backup() {
+    mkdir -p "$BACKUP_DIR" "$ROOT/data"
+    chmod 0700 "$BACKUP_DIR"
+    local stamp target
+    local items=(data)
+    stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+    target="$BACKUP_DIR/bot-tg-schedule-$stamp.tar.gz"
+    if [[ -f "$ROOT/.env" ]]; then
+        items=(.env data)
+    fi
+    tar -czf "$target.tmp" -C "$ROOT" "${items[@]}"
+    chmod 0600 "$target.tmp"
+    mv "$target.tmp" "$target"
+    printf '%s\n' "$target"
+}
+
+cmd="${1:-help}"
+shift || true
+case "$cmd" in
+    status|ps)
+        docker ps -a --filter "name=^/${CONTAINER}$" \
+            --format "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}"
+        if docker inspect "$CONTAINER" >/dev/null 2>&1; then
+            docker inspect "$CONTAINER" \
+                --format 'Image={{.Config.Image}} ID={{.Image}} Restarts={{.RestartCount}} Started={{.State.StartedAt}}'
+        fi
+        ;;
+    logs)
+        follow=""
+        lines="100"
+        for arg in "$@"; do
+            case "$arg" in
+                -f|--follow) follow="-f" ;;
+                ''|*[!0-9]*) ;;
+                *) lines="$arg" ;;
+            esac
+        done
+        exec docker logs ${follow:+"$follow"} --tail "$lines" --timestamps "$CONTAINER"
+        ;;
+    test)
+        run_test
+        ;;
+    backup)
+        backup
+        ;;
+    rebuild|up)
+        backup >/dev/null
+        run_test
+        compose up -d --build
+        ;;
+    restart|start|stop)
+        docker "$cmd" "$CONTAINER"
+        ;;
+    exec)
+        if (($#)); then
+            exec docker exec -i "$CONTAINER" "$@"
+        fi
+        exec docker exec -it "$CONTAINER" /bin/sh
+        ;;
+    help|-h|--help)
+        usage
+        ;;
+    *)
+        printf 'Неизвестная команда: %s\n' "$cmd" >&2
+        usage >&2
+        exit 2
+        ;;
+esac

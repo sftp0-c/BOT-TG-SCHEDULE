@@ -12,7 +12,11 @@ CMD_RE = re.compile(
     re.IGNORECASE,
 )
 # Конкретная дата: 21.10 или 21.10.2026.
-DATE_RE = re.compile(r"^(\d{1,2})\.(\d{1,2})(?:\.(\d{2,4}))?$")
+DATE_RE = re.compile(r"^(\d{1,2})\.(\d{1,2})(?:\.(\d{2}|\d{4}))?$")
+
+
+class ScheduleArgumentError(ValueError):
+    """Команда расписания распознана, но её аргумент некорректен."""
 
 
 def parse_argument(arg_raw: str) -> TargetDay:
@@ -42,11 +46,13 @@ def parse_argument(arg_raw: str) -> TargetDay:
             year += 2000
         try:
             explicit_day = date(year, month_number, day_number)
-        except ValueError:
-            return resolve_day("auto")
+        except ValueError as exc:
+            raise ScheduleArgumentError("Такой даты не существует.") from exc
         return TargetDay(explicit_day, f"{explicit_day:%d.%m.%Y}")
 
-    return resolve_day("auto")
+    raise ScheduleArgumentError(
+        "Не понял аргумент. Используйте: сегодня, завтра, послезавтра, неделя или дату DD.MM."
+    )
 
 
 def parse_command(text: str, *, allow_bare: bool = False) -> TargetDay | None:
