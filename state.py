@@ -1,4 +1,4 @@
-"""Персистентное состояние бота (data/state.json): пользователи, баны, рассылка и чаты."""
+"""Персистентное состояние бота: пользователи, баны и групповые публикации."""
 from __future__ import annotations
 
 import json
@@ -25,10 +25,7 @@ class UserRecord:
     username: str = ""
     full_name: str = ""
     private_started: bool = False
-    dispatch_enabled: bool = True
-    dispatch_muted_by_admin: bool = False
     last_seen: float = 0.0
-    last_sent_week_monday: str | None = None
 
     @property
     def display_name(self) -> str:
@@ -128,10 +125,7 @@ class BotState:
                     username=str(item.get("username") or ""),
                     full_name=str(item.get("full_name") or ""),
                     private_started=bool(item.get("private_started", False)),
-                    dispatch_enabled=bool(item.get("dispatch_enabled", True)),
-                    dispatch_muted_by_admin=bool(item.get("dispatch_muted_by_admin", False)),
                     last_seen=float(item.get("last_seen") or 0.0),
-                    last_sent_week_monday=item.get("last_sent_week_monday") or None,
                 )
             except (TypeError, ValueError):
                 continue
@@ -200,7 +194,7 @@ class BotState:
         target = self.path
         target.parent.mkdir(parents=True, exist_ok=True)
         payload: dict[str, Any] = {
-            "version": 1,
+            "version": 2,
             "weekly_sent_monday": self.weekly_sent_monday,
             "users": {str(uid): asdict(rec) for uid, rec in sorted(self.users.items())},
             "bans": {str(uid): asdict(rec) for uid, rec in sorted(self.bans.items())},
@@ -246,8 +240,6 @@ class BotState:
                     username=clean_username,
                     full_name=clean_name,
                     private_started=is_private,
-                    dispatch_enabled=True,
-                    dispatch_muted_by_admin=False,
                     last_seen=now_ts,
                 )
                 self.users[user_id] = rec
@@ -409,72 +401,6 @@ class BotState:
                     del self.bans[uid]
                 self._save()
             return sorted(self.bans.values(), key=lambda b: b.created_at, reverse=True)
-
-    # --- Управление рассылкой ---
-
-    def set_dispatch_admin(self, user_id: int, *, enabled: bool) -> UserRecord:
-        with self._lock:
-            self._ensure_loaded()
-            rec = self.users.get(user_id)
-            if rec is None:
-                rec = UserRecord(user_id=user_id)
-                self.users[user_id] = rec
-            rec.dispatch_enabled = enabled
-            rec.dispatch_muted_by_admin = not enabled
-            self._save()
-            return rec
-
-    def set_dispatch_self(self, user_id: int, *, enabled: bool) -> tuple[bool, str]:
-        with self._lock:
-            self._ensure_loaded()
-            rec = self.users.get(user_id)
-            if rec is None:
-                rec = UserRecord(user_id=user_id, private_started=True)
-                self.users[user_id] = rec
-            if enabled and rec.dispatch_muted_by_admin:
-                return (
-                    False,
-                    "⛔ Рассылка для вас отключена администратором. Обратитесь к админу.",
-                )
-            rec.dispatch_enabled = enabled
-            self._save()
-            if enabled:
-                return True, "✅ Еженедельная рассылка расписания включена."
-            return True, "🔕 Еженедельная рассылка расписания остановлена."
-
-    def get_dispatch_recipients(self, *, now_ts: float | None = None) -> list[UserRecord]:
-        with self._lock:
-            self._ensure_loaded()
-            # Очищаем просроченные баны перед выборкой
-            self.list_active_bans(now_ts=now_ts)
-            recipients: list[UserRecord] = []
-            for uid, rec in sorted(self.users.items()):
-                if not rec.private_started:
-                    continue
-                if not rec.dispatch_enabled or rec.dispatch_muted_by_admin:
-                    continue
-                if uid in self.bans:
-                    continue
-                recipients.append(rec)
-            return recipients
-
-    def mark_dispatch_sent(self, user_id: int, week_monday_iso: str) -> None:
-        with self._lock:
-            self._ensure_loaded()
-            rec = self.users.get(user_id)
-            if rec is None:
-                return
-            rec.last_sent_week_monday = week_monday_iso
-            self._save()
-
-    def disable_unreachable_dispatch(self, user_id: int) -> None:
-        with self._lock:
-            self._ensure_loaded()
-            rec = self.users.get(user_id)
-            if rec is None:
-                return
-            rec.dispatch_enabled = False
-            self._save()
 
     # --- Чаты для воскресного автопостинга с закрепом ---
 

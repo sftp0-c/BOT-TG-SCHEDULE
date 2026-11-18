@@ -8,16 +8,13 @@
   /расписание послезавтра             — через день.
   /расписание 21.10 | 21.10.2026      — на конкретную дату.
   /расписание неделя | все            — столбец группы на всю неделю из PDF.
-  /stop_mail | /start_mail            — остановить/включить недельную рассылку в ЛС.
 
-Команды администратора (работают в ЛС боту и в группах):
+Команды администратора (чувствительные команды работают только в ЛС):
   /admin                              — сводка и справка по управлению.
   /users                              — список пользователей (ID, @username, статусы).
   /ban <id|@user> [срок] [причина]    — ограничить доступ (например: 30m, 2h, 7d или навсегда).
   /unban <id|@user>                   — снять ограничение доступа.
   /bans                               — список активных ограничений.
-  /mute_dispatch <id|@user>           — остановить рассылку конкретному человеку.
-  /unmute_dispatch <id|@user>         — возобновить рассылку человеку.
   /autoschedule on|off [chat_id]      — вкл/выкл воскресный автопостинг с закрепом.
   /weekly_chats                       — список групп автопостинга и проверка прав закрепа.
   /weekly_now [test|current|all]      — ручной запуск недельной рассылки.
@@ -300,8 +297,7 @@ def help_text(*, is_admin_user: bool = False) -> str:
         "• /расписание завтра — на следующий день\n"
         "• /расписание послезавтра — через день\n"
         "• /расписание 21.10 — на конкретную дату (можно 21.10.2026)\n"
-        "• /расписание неделя (или все) — вся неделя из PDF альбомом\n"
-        "• /stop_mail и /start_mail — остановить/возобновить воскресную рассылку в ЛС\n\n"
+        "• /расписание неделя (или все) — вся неделя из PDF альбомом\n\n"
         "Вместо «/» можно писать «!»: !расписание завтра.\n"
         "В личных сообщениях можно писать просто: сегодня, завтра, неделя или 21.10."
     )
@@ -313,8 +309,6 @@ def help_text(*, is_admin_user: bool = False) -> str:
             "• /ban <id|@user> [срок: 30m/2h/7d] [причина] — ограничить доступ\n"
             "• /unban <id|@user> — снять ограничение\n"
             "• /bans — список активных ограничений\n"
-            "• /mute_dispatch <id|@user> — остановить рассылку человеку\n"
-            "• /unmute_dispatch <id|@user> — вернуть человека в рассылку\n"
             "• /autoschedule on|off [chat_id] — вкл/выкл воскресный пост + закреп\n"
             "• /weekly_chats — группы воскресной рассылки и статус прав закрепа\n"
             "• /weekly_now [test|current|all] — ручной запуск недельной рассылки"
@@ -599,7 +593,7 @@ async def _publish_weekly_schedule(
     notify_chat_id: int | None = None,
     test_only: bool = False,
 ) -> tuple[bool, str]:
-    """Собирает расписание на неделю, отправляет в группы (с закрепом) и подписчикам в ЛС.
+    """Собирает расписание и публикует его в подключённые группы с закрепом.
 
     Если ``require_target_week=True``, проверяет, что даты в PDF попадают в неделю ``target_monday``.
     """
@@ -672,11 +666,6 @@ async def _publish_weekly_schedule(
             if STATE.chats.get(cid) is None
             or STATE.chats[cid].last_sent_week_monday != actual_monday.isoformat()
         ]
-        recipients = [
-            rec
-            for rec in STATE.get_dispatch_recipients()
-            if rec.last_sent_week_monday != actual_monday.isoformat()
-        ]
 
         group_ok = 0
         pin_ok = 0
@@ -731,45 +720,20 @@ async def _publish_weekly_schedule(
                 log.warning("Ошибка отправки расписания в чат %s: %s", cid, send_exc)
                 group_errors.append(f"чат {cid}: {type(send_exc).__name__}")
 
-        dm_ok = 0
-        dm_fail = 0
-        for rec in recipients:
-            try:
-                photos = [FSInputFile(item.path) for item in out.images]
-                if len(photos) == 1:
-                    await bot.send_photo(rec.user_id, photos[0], caption=caption_text)
-                else:
-                    builder = MediaGroupBuilder(caption=caption_text)
-                    for photo in photos:
-                        builder.add_photo(photo)
-                    await bot.send_media_group(rec.user_id, builder.build())
-                dm_ok += 1
-                STATE.mark_dispatch_sent(rec.user_id, actual_monday.isoformat())
-                await asyncio.sleep(0.15)
-            except TelegramForbiddenError:
-                STATE.disable_unreachable_dispatch(rec.user_id)
-            except Exception as dm_exc:  # noqa: BLE001
-                log.debug("Не удалось отправить рассылку пользователю %s: %s", rec.user_id, dm_exc)
-                dm_fail += 1
-
-        total_destinations = len(chat_ids) + len(recipients)
-        unresolved = len(chat_ids) - group_ok + dm_fail
+        unresolved = len(chat_ids) - group_ok
         all_delivered = unresolved == 0
         if require_target_week and all_delivered:
             STATE.set_weekly_sent_monday(monday.isoformat())
 
-        status_icon = "✅" if all_delivered else ("⚠️" if group_ok + dm_ok else "❌")
+        status_icon = "✅" if all_delivered else ("⚠️" if group_ok else "❌")
         summary = (
-            f"{status_icon} Недельная рассылка ({first_day:%d.%m.%Y}–{last_day:%d.%m.%Y}) завершена.\n"
-            f"• Групп: {group_ok}/{len(chat_ids)} (закреплено: {pin_ok})\n"
-            f"• Пользователей в ЛС: {dm_ok}"
+            f"{status_icon} Недельная публикация ({first_day:%d.%m.%Y}–{last_day:%d.%m.%Y}) завершена.\n"
+            f"• Групп: {group_ok}/{len(chat_ids)} (закреплено: {pin_ok})"
         )
-        if dm_fail:
-            summary += f" (не доставлено: {dm_fail})"
-        if not chat_ids and not recipients:
-            summary += "\nℹ️ Для этой недели нет новых адресатов: все уже получили расписание или рассылка не подключена."
+        if not chat_ids:
+            summary += "\nℹ️ Для этой недели нет новых групп: все уже получили расписание или автопостинг не подключён."
         elif not all_delivered:
-            summary += "\n⏳ Не все адресаты получили расписание — автоматическая попытка будет повторена."
+            summary += "\n⏳ Не все группы получили расписание — автоматическая попытка будет повторена."
         if group_errors:
             summary += "\n⚠️ Замечания: " + "; ".join(group_errors)
         return all_delivered, summary
@@ -888,32 +852,6 @@ async def cmd_help(message: Message) -> None:
     )
 
 
-@dp.message(Command("stop_mail"))
-async def cmd_stop_mail(message: Message) -> None:
-    if message.chat.type != ChatType.PRIVATE:
-        await message.answer(
-            "Эта команда работает в личном чате с ботом. Откройте бота и отправьте её там."
-        )
-        return
-    if not message.from_user:
-        return
-    _ok, reply = STATE.set_dispatch_self(message.from_user.id, enabled=False)
-    await message.answer(reply)
-
-
-@dp.message(Command("start_mail"))
-async def cmd_start_mail(message: Message) -> None:
-    if message.chat.type != ChatType.PRIVATE:
-        await message.answer(
-            "Эта команда работает в личном чате с ботом. Откройте бота и отправьте её там."
-        )
-        return
-    if not message.from_user:
-        return
-    _ok, reply = STATE.set_dispatch_self(message.from_user.id, enabled=True)
-    await message.answer(reply)
-
-
 # --- Админ-команды (удобно вызывать в ЛС боту) ---
 
 
@@ -933,7 +871,6 @@ def _check_admin_message(message: Message) -> bool:
 
 def _admin_panel_text() -> str:
     users = STATE.list_users(limit=500)
-    recipients = STATE.get_dispatch_recipients()
     bans = STATE.list_active_bans()
     weekly_chats = STATE.get_weekly_chat_ids()
     mon = next_monday()
@@ -942,7 +879,7 @@ def _admin_panel_text() -> str:
     lines = [
         "👑 Панель администратора",
         f"• Группа: {config.TARGET_GROUP}",
-        f"• Известно пользователей: {len(users)} (в ЛС-рассылке: {len(recipients)})",
+        f"• Известно пользователей: {len(users)}",
         f"• Активных ограничений доступа: {len(bans)}",
         f"• Чатов для воскресного закрепа (Вс {config.WEEKLY_SEND_HOUR:02d}:{config.WEEKLY_SEND_MINUTE:02d}): {len(weekly_chats)}",
         f"• Ближайший понедельник: {mon:%d.%m.%Y} (рассылка: {'выполнена' if sent_mon == mon.isoformat() else 'ожидается'})",
@@ -953,8 +890,6 @@ def _admin_panel_text() -> str:
         "• /ban <id|@user> [30m|2h|7d] [причина] — ограничить доступ",
         "• /unban <id|@user> — снять ограничение доступа",
         "• /bans — список заблокированных",
-        "• /mute_dispatch <id|@user> — остановить рассылку человеку",
-        "• /unmute_dispatch <id|@user> — вернуть человека в рассылку",
         "• /weekly_chats — список групп и статус закрепа",
         "• /autoschedule on|off [chat_id] — настроить автопостинг группы",
         "• /weekly_now [test|current|all] — запустить недельную рассылку вручную",
@@ -993,14 +928,10 @@ def _admin_users_text(limit: int = 40) -> str:
         ban = STATE.get_active_ban(u.user_id)
         if ban:
             status = f"⛔ БАН ({format_ban_until(ban.until)})"
-        elif u.dispatch_muted_by_admin:
-            status = "🔇 рассылка откл. админом"
-        elif not u.private_started:
-            status = "💬 только в группе"
-        elif not u.dispatch_enabled:
-            status = "🔕 отписался сам"
+        elif u.private_started:
+            status = "💬 писал боту в ЛС"
         else:
-            status = "🔔 рассылка вкл."
+            status = "💬 только в группе"
         admin_tag = " 👑" if config.is_admin(u.user_id) else ""
         lines.append(f"• {u.display_name}{admin_tag} — {status}")
 
@@ -1093,35 +1024,6 @@ async def cmd_bans(message: Message) -> None:
     if not _check_admin_message(message):
         return
     await message.answer(_admin_bans_text())
-
-
-@dp.message(Command("mute_dispatch"))
-async def cmd_mute_dispatch(message: Message) -> None:
-    if not _check_admin_message(message):
-        return
-    args_text = _command_args(message)
-    uid, label, _rest = _extract_target_user(message, args_text)
-    if uid is None:
-        await message.answer(f"⚠️ {label}")
-        return
-    STATE.set_dispatch_admin(uid, enabled=False)
-    await message.answer(
-        f"🔇 Рассылка остановлена для {label}.\n"
-        "Пользователь по-прежнему может запрашивать расписание вручную (если не в бане)."
-    )
-
-
-@dp.message(Command("unmute_dispatch"))
-async def cmd_unmute_dispatch(message: Message) -> None:
-    if not _check_admin_message(message):
-        return
-    args_text = _command_args(message)
-    uid, label, _rest = _extract_target_user(message, args_text)
-    if uid is None:
-        await message.answer(f"⚠️ {label}")
-        return
-    STATE.set_dispatch_admin(uid, enabled=True)
-    await message.answer(f"🔔 Рассылка снова разрешена/включена для {label}.")
 
 
 @dp.message(Command("autoschedule"))
@@ -1241,8 +1143,8 @@ async def cmd_weekly_now(message: Message, bot: Bot) -> None:
         await message.answer(
             "Использование:\n"
             "• /weekly_now test — прислать пробный сбор недели вам в ЛС\n"
-            "• /weekly_now current — разослать текущую неделю с сайта в группы (с закрепом) и подписчикам\n"
-            "• /weekly_now all — разослать следующую неделю (если выложена) в группы и подписчикам"
+            "• /weekly_now current — опубликовать текущую неделю в группы с закрепом\n"
+            "• /weekly_now all — опубликовать следующую неделю, если она выложена"
         )
         return
 
@@ -1429,10 +1331,7 @@ async def setup_bot_commands(bot: Bot) -> None:
         BotCommand(command="schedule", description="Расписание на день или неделю"),
         BotCommand(command="help", description="Справка и кнопки выбора"),
     ]
-    private_commands = public_commands + [
-        BotCommand(command="stop_mail", description="Остановить рассылку расписания в ЛС"),
-        BotCommand(command="start_mail", description="Включить рассылку расписания в ЛС"),
-    ]
+    private_commands = list(public_commands)
     with suppress(Exception):
         await bot.set_my_commands(public_commands, scope=BotCommandScopeDefault())
         await bot.set_my_commands(
@@ -1446,8 +1345,6 @@ async def setup_bot_commands(bot: Bot) -> None:
         BotCommand(command="ban", description="👑 Ограничить доступ пользователю"),
         BotCommand(command="unban", description="👑 Снять ограничение доступа"),
         BotCommand(command="bans", description="👑 Активные ограничения доступа"),
-        BotCommand(command="mute_dispatch", description="👑 Остановить рассылку человеку"),
-        BotCommand(command="unmute_dispatch", description="👑 Вернуть человека в рассылку"),
         BotCommand(command="weekly_chats", description="👑 Группы воскресного закрепа"),
         BotCommand(command="autoschedule", description="👑 Вкл/выкл автопостинг группы"),
         BotCommand(command="weekly_now", description="👑 Ручной запуск недельной рассылки"),

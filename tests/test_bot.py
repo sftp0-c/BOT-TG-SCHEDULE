@@ -263,40 +263,127 @@ def test_render_reused_output_does_not_return_stale_image(tmp_path: Path) -> Non
     assert second.images == []
 
 
-def test_state_bans_and_dispatch(tmp_path: Path) -> None:
-    st = BotState(tmp_path / "state.json")
-    st.touch_user(111, username="student_one", full_name="Иван", is_private=True)
-    st.touch_user(222, username="student_two", full_name="Пётр", is_private=True)
+def test_state_users_bans_and_v1_migration(tmp_path: Path) -> None:
+    path = tmp_path / "state.json"
+    path.write_text(
+        """{
+  "version": 1,
+  "users": {
+    "111": {
+      "username": "student_one",
+      "full_name": "Иван",
+      "private_started": true,
+      "dispatch_enabled": false,
+      "dispatch_muted_by_admin": true,
+      "last_sent_week_monday": "2026-11-23"
+    },
+    "222": {
+      "username": "student_two",
+      "full_name": "Пётр",
+      "private_started": false
+    }
+  }
+} """,
+        encoding="utf-8",
+    )
+    st = BotState(path)
 
-    # Поиск по @username
     uid, _ = st.resolve_user("@student_one")
     assert uid == 111
+    assert st.get_user(111).private_started is True
+    assert st.get_user(222).private_started is False
 
-    # Временный бан и автоистечение
     st.ban_user(111, duration=timedelta(seconds=60), reason="спам", banned_by=1075591078)
-    assert st.get_active_ban(111, now_ts=1000.0) is not None
-    # Через 100 секунд бан должен автоматически сняться
     ban_rec = st.get_active_ban(111)
     assert ban_rec is not None
     assert st.get_active_ban(111, now_ts=ban_rec.created_at + 120) is None
 
-    # Остановка рассылки админом запрещает пользователю включить её обратно самому
-    st.set_dispatch_admin(222, enabled=False)
-    ok, _msg = st.set_dispatch_self(222, enabled=True)
-    assert ok is False
-    recipients = [r.user_id for r in st.get_dispatch_recipients()]
-    assert 222 not in recipients
-    assert 111 in recipients
+    # Любое штатное сохранение мигрирует state v1 в v2 без legacy DM-полей.
+    st.touch_user(333, username="new_user", full_name="Новый")
+    raw = path.read_text(encoding="utf-8")
+    assert '"version": 2' in raw
+    assert "dispatch_enabled" not in raw
+    assert "dispatch_muted_by_admin" not in raw
+    assert "last_sent_week_monday" not in raw.split('"chats"', 1)[0]
 
-    # Возврат в рассылку админом
-    st.set_dispatch_admin(222, enabled=True)
-    assert 222 in [r.user_id for r in st.get_dispatch_recipients()]
+    reloaded = BotState(path)
+    assert reloaded.get_user(111).username == "student_one"
+    assert reloaded.get_user(333).username == "new_user"
 
-    st.mark_dispatch_sent(222, "2026-11-23")
-    reloaded = BotState(tmp_path / "state.json")
-    assert reloaded.get_user(222).last_sent_week_monday == "2026-11-23"
-    reloaded.disable_unreachable_dispatch(222)
-    assert 222 not in [r.user_id for r in reloaded.get_dispatch_recipients()]
+
+def test_group_only_help_and_command_scopes(monkeypatch: pytest.MonkeyPatch) -> None:
+    import asyncio
+
+    removed = {"stop_mail", "start_mail", "mute_dispatch", "unmute_dispatch"}
+    assert all(command not in bot.help_text(is_admin_user=True) for command in removed)
+    assert "ЛС-рассыл" not in bot._admin_panel_text()
+
+    monkeypatch.setattr(config, "ADMIN_IDS", (123,))
+    api = SimpleNamespace(set_my_commands=AsyncMock())
+    asyncio.run(bot.setup_bot_commands(api))  # type: ignore[arg-type]
+    assert api.set_my_commands.await_count == 3
+    for call in api.set_my_commands.await_args_list:
+        commands_arg = call.args[0]
+        names = {item.command for item in commands_arg}
+        assert not names & removed
+    admin_names = {item.command for item in api.set_my_commands.await_args_list[-1].args[0]}
+    assert {"users", "ban", "bans", "weekly_chats", "autoschedule", "weekly_now"} <= admin_names
+
+
+def test_group_only_user_statuses(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    test_state = BotState(tmp_path / "state.json")
+    test_state.touch_user(111, username="private_user", is_private=True)
+    test_state.touch_user(222, username="group_user", is_private=False)
+    monkeypatch.setattr(bot, "STATE", test_state)
+    text = bot._admin_users_text()
+    assert "писал боту в ЛС" in text
+    assert "только в группе" in text
+    assert "рассылка" not in text.lower()
+
+
+def test_weekly_publisher_targets_groups_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import asyncio
+
+    pdf_path = SAMPLES_DIR / "25-27-25-31_00e8da94d0354de8.pdf"
+    found = source.ScheduleFile(
+        url=str(pdf_path),
+        name=pdf_path.name,
+        path=pdf_path,
+    )
+    test_state = BotState(tmp_path / "state.json")
+    test_state.touch_user(111, username="private_user", is_private=True)
+    test_state.set_chat_weekly(-1001, enabled=True, title="Учебная группа")
+    monkeypatch.setattr(bot, "STATE", test_state)
+    monkeypatch.setattr(bot, "TEMP_ROOT", tmp_path / "render")
+    monkeypatch.setattr(bot, "fetch_schedule_file", AsyncMock(return_value=found))
+    monkeypatch.setattr(bot, "WEEKLY_PUBLISH_LOCK", asyncio.Lock())
+
+    api = SimpleNamespace(
+        send_photo=AsyncMock(),
+        send_media_group=AsyncMock(
+            return_value=[SimpleNamespace(message_id=700)]
+        ),
+        pin_chat_message=AsyncMock(),
+        unpin_chat_message=AsyncMock(),
+    )
+    ok, report = asyncio.run(
+        bot.publish_weekly_schedule(
+            api,  # type: ignore[arg-type]
+            target_monday=date(2026, 9, 28),
+            require_target_week=True,
+        )
+    )
+    assert ok is True
+    api.send_media_group.assert_awaited_once()
+    assert api.send_media_group.await_args.args[0] == -1001
+    assert all(
+        call.args[0] != 111 for call in api.send_photo.await_args_list
+    )
+    assert "Пользователей" not in report
+    assert test_state.get_weekly_sent_monday() == "2026-09-28"
+    assert test_state.chats[-1001].last_sent_week_monday == "2026-09-28"
 
 
 def test_antispam_guard(monkeypatch: pytest.MonkeyPatch) -> None:
