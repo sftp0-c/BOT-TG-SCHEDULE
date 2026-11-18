@@ -1,0 +1,19 @@
+services:
+  bot-tg-schedule:
+    build:
+      context: .
+      network: host
+    image: bot-tg-schedule:latest
+    container_name: bot-tg-schedule
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - ./.env:/app/.env:ro
+      - ./data:/app/data
+    environment:
+      TZ: Asia/Yekaterinburg
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
