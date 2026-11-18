@@ -37,14 +37,23 @@ run_test() {
 backup() {
     mkdir -p "$BACKUP_DIR" "$ROOT/data"
     chmod 0700 "$BACKUP_DIR"
-    local stamp target
-    local items=(data)
+    local stamp target env_copy
     stamp="$(date -u +%Y%m%dT%H%M%SZ)"
     target="$BACKUP_DIR/bot-tg-schedule-$stamp.tar.gz"
+    env_copy=""
     if [[ -f "$ROOT/.env" ]]; then
-        items=(.env data)
+        env_copy="$(mktemp)"
+        cp "$ROOT/.env" "$env_copy"
     fi
-    tar -czf "$target.tmp" -C "$ROOT" "${items[@]}"
+    docker run --rm -i \
+        --user 0:0 \
+        --volume "$ROOT/data:/source:ro" \
+        --volume "${env_copy:-/dev/null}:/input.env:ro" \
+        --entrypoint sh \
+        "$IMAGE" \
+        -ec 'mkdir -p /backup/data; cp -a /source/. /backup/data/; if [ -s /input.env ]; then cp /input.env /backup/.env; fi; tar -czf - -C /backup .' \
+        > "$target.tmp"
+    [[ -z "$env_copy" ]] || rm -f "$env_copy"
     chmod 0600 "$target.tmp"
     mv "$target.tmp" "$target"
     printf '%s\n' "$target"
